@@ -73,7 +73,7 @@ ACTIONS = {
     "clean_right": "clean_right/clean_right.gif",
     "clean_dust": "clean_dust/clean_dust.gif",
 
-    # ✅ 새로 추가: 랜덤 이동 중 클릭/더블클릭에서 쓸 낙하 모션
+    # ✅ 낙하 모션
     "fall_left": "fall_left/fall_left.gif",
     "fall_right": "fall_right/fall_right.gif",
 }
@@ -84,9 +84,8 @@ FLOOR_SNAP_EXCLUDE = {
     "mopping", "clean_dust"
 }
 
-# ✅ 여기가 새로 추가된 부분: 한 번만 재생해야 하는 액션들
-ONE_SHOT_ACTIONS = {"fall_left", "fall_right", "surprise", "angry"}
-
+# ✅ 여기 추가: 한 번만 재생하고 끝낼 액션
+ONE_SHOT_ACTIONS = {"fall_left", "fall_right"}
 
 def desktop_virtual_rect():
     app = QtWidgets.QApplication.instance()
@@ -177,6 +176,9 @@ class Pet(QtWidgets.QMainWindow):
         self.clean_timer.setInterval(6000)
         self.clean_timer.timeout.connect(self._cleaning_step)
         self.clean_vx      = 0
+
+        # ✅ fall 복귀 정보
+        self._fall_info = None  # {"was_random": bool, "direction": "left"|"right"}
 
         self._predecode_all()
         self._rebuild_scaled_cache()
@@ -606,15 +608,37 @@ class Pet(QtWidgets.QMainWindow):
         if not frames: return
         self._apply_frame(frames[self.current_frame_idx][0])
 
-    # ✅ 여기 수정됨: 원샷 액션은 끝 프레임에서 멈추기
+    def _end_fall_from_anim(self):
+        """fall_* 액션이 마지막 프레임까지 재생된 직후에 호출돼서 원래 상태로 즉시 복귀"""
+        info = self._fall_info
+        self._fall_info = None
+        if not info:
+            # 복귀 정보가 없으면 그냥 idle
+            self.set_action("idle", force=True, suppress_bounce=False)
+            return
+
+        was_random = info.get("was_random", False)
+        direction  = info.get("direction", "right")
+
+        if was_random:
+            # 랜덤 이동 상태로 다시 이어가기
+            self.random_walk = True
+            if direction == "left":
+                self.rw_vx = -2
+                self.set_action("walk_left", force=True, suppress_bounce=False)
+            else:
+                self.rw_vx = 2
+                self.set_action("walk_right", force=True, suppress_bounce=False)
+        else:
+            # 랜덤이 아니면 가만히
+            self.set_action("idle", force=True, suppress_bounce=False)
+
     def _update_animation(self, now: float):
         if self.giant_animating:
             return
-        if not self.current_action:
-            return
+        if not self.current_action: return
         frames = self.animations.get(self.current_action)
-        if not frames:
-            return
+        if not frames: return
         if now < self.next_frame_time:
             return
 
@@ -622,15 +646,17 @@ class Pet(QtWidgets.QMainWindow):
         orig_fps = meta.get("orig_fps", 20.0)
         step = max(1, round(orig_fps / DISPLAY_FPS))
 
+        # ✅ fall_left/right는 원샷 처리
         if self.current_action in ONE_SHOT_ACTIONS:
             next_idx = self.current_frame_idx + step
             if next_idx >= len(frames):
-                # 마지막 프레임에 고정
+                # 마지막 프레임 한 번 보여주고
                 self.current_frame_idx = len(frames) - 1
                 pix, _ = frames[self.current_frame_idx]
                 self._apply_frame(pix)
-                # 원샷일 때는 더 이상 애니메이션 안 돌아가게 멀리 밀어두기
-                self.next_frame_time = now + 9999
+                self.next_frame_time = now + DISPLAY_DELAY
+                # 그리고 바로 원래 모드로 복귀
+                QtCore.QTimer.singleShot(0, self._end_fall_from_anim)
                 return
             else:
                 self.current_frame_idx = next_idx
@@ -671,46 +697,31 @@ class Pet(QtWidgets.QMainWindow):
 
         now = time.monotonic()
 
-        raw = self.raw_animations.get(fall_action)
-        if raw:
-            total_sec = sum(d for (_pm, d) in raw)
-        else:
-            total_sec = 1.0  # fallback
-
+        # (1) 지금 랜덤 이동 상태인지 기록해뒀다가 끝나면 복구
         was_random = self.random_walk
+        # fall 재생 동안엔 랜덤 이동을 멈춰둔다
         self.random_walk = False
 
-        self.temp_token += 1
-        tok = self.temp_token
-        self.active_temp_action = fall_action
-        self.force_action_until = now + total_sec
+        # (2) fall이 끝날 때 쓸 정보 저장
+        self._fall_info = {
+            "was_random": was_random,
+            "direction": direction,
+        }
 
+        # (3) temp 토큰으로 다른 임시 액션이 덮어쓰지 못하게
+        self.temp_token += 1
+        self.active_temp_action = fall_action
+        # force_action_until 은 바로 사용하지 않아도 됨(프레임 끝에서 복귀하므로)
+        self.force_action_until = 0.0
+
+        # (4) fall 모션 시작
         self.set_action(fall_action, force=True, suppress_bounce=True)
         self.manual_drop = False
         self.free_bounce = False
         self.vx = 0.0
         self.vy = 0.0
-
-        def _end_fall():
-            if tok != self.temp_token:
-                return
-
-            self.active_temp_action = None
-            self.force_action_until = 0.0
-
-            if was_random:
-                if direction == "left":
-                    self.random_walk = True
-                    self.rw_vx = -2
-                    self.set_action("walk_left", force=True, suppress_bounce=False)
-                else:
-                    self.random_walk = True
-                    self.rw_vx = 2
-                    self.set_action("walk_right", force=True, suppress_bounce=False)
-            else:
-                self.set_action("idle", force=True, suppress_bounce=False)
-
-        QtCore.QTimer.singleShot(int(total_sec * 1000), _end_fall)
+        # ✅ 여기서는 더 이상 타이머로 되돌리지 않는다.
+        #    마지막 프레임에 도달하면 _update_animation()에서 _end_fall_from_anim()이 즉시 복귀시킨다.
 
     # ===== 마우스 =====
     def mousePressEvent(self, ev):
