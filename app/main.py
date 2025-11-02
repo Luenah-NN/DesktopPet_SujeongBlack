@@ -84,6 +84,9 @@ FLOOR_SNAP_EXCLUDE = {
     "mopping", "clean_dust"
 }
 
+# ✅ 여기가 새로 추가된 부분: 한 번만 재생해야 하는 액션들
+ONE_SHOT_ACTIONS = {"fall_left", "fall_right", "surprise", "angry"}
+
 
 def desktop_virtual_rect():
     app = QtWidgets.QApplication.instance()
@@ -603,18 +606,38 @@ class Pet(QtWidgets.QMainWindow):
         if not frames: return
         self._apply_frame(frames[self.current_frame_idx][0])
 
+    # ✅ 여기 수정됨: 원샷 액션은 끝 프레임에서 멈추기
     def _update_animation(self, now: float):
         if self.giant_animating:
             return
-        if not self.current_action: return
+        if not self.current_action:
+            return
         frames = self.animations.get(self.current_action)
-        if not frames: return
+        if not frames:
+            return
         if now < self.next_frame_time:
             return
+
         meta = self.anim_meta.get(self.current_action, {"orig_fps": 20.0})
         orig_fps = meta.get("orig_fps", 20.0)
         step = max(1, round(orig_fps / DISPLAY_FPS))
-        self.current_frame_idx = (self.current_frame_idx + step) % len(frames)
+
+        if self.current_action in ONE_SHOT_ACTIONS:
+            next_idx = self.current_frame_idx + step
+            if next_idx >= len(frames):
+                # 마지막 프레임에 고정
+                self.current_frame_idx = len(frames) - 1
+                pix, _ = frames[self.current_frame_idx]
+                self._apply_frame(pix)
+                # 원샷일 때는 더 이상 애니메이션 안 돌아가게 멀리 밀어두기
+                self.next_frame_time = now + 9999
+                return
+            else:
+                self.current_frame_idx = next_idx
+        else:
+            # 기존처럼 루프
+            self.current_frame_idx = (self.current_frame_idx + step) % len(frames)
+
         pix, _ = frames[self.current_frame_idx]
         self._apply_frame(pix)
         self.next_frame_time = now + DISPLAY_DELAY
@@ -646,55 +669,45 @@ class Pet(QtWidgets.QMainWindow):
         if fall_action not in self.animations:
             return
 
-        # 1) 이 모션 도는 동안에는 랜덤 이동이 덮어쓰지 못하도록 막아야 함
         now = time.monotonic()
 
-        # (1) 원본 fall GIF 길이 계산
         raw = self.raw_animations.get(fall_action)
         if raw:
-            total_sec = sum(d for (_pm, d) in raw)   # d는 이미 초 단위로 들어와 있음
+            total_sec = sum(d for (_pm, d) in raw)
         else:
-            total_sec = 1.2  # fallback
+            total_sec = 1.0  # fallback
 
-        # (2) 지금 랜덤 이동 상태인지 기록해뒀다가 끝나면 복구
         was_random = self.random_walk
         self.random_walk = False
 
-        # (3) temp 액션으로 세팅해두면 update_loop가 건드리지 않음
         self.temp_token += 1
         tok = self.temp_token
         self.active_temp_action = fall_action
         self.force_action_until = now + total_sec
 
-        # 2) 모션 시작
         self.set_action(fall_action, force=True, suppress_bounce=True)
         self.manual_drop = False
         self.free_bounce = False
         self.vx = 0.0
         self.vy = 0.0
 
-        # 3) 끝나면 원래 상태로 복귀
         def _end_fall():
-            # fall 도는 동안에 다른 temp가 들어왔으면 무시
             if tok != self.temp_token:
                 return
 
             self.active_temp_action = None
             self.force_action_until = 0.0
 
-            # 끝날 때 랜덤 이동이 여전히 켜져있던 상황이었으면 복구
             if was_random:
-                # 방향은 fall할 때의 방향으로 다시 설정
                 if direction == "left":
                     self.random_walk = True
-                    self.rw_vx = -2    # 왼쪽으로 다시 걷기
+                    self.rw_vx = -2
                     self.set_action("walk_left", force=True, suppress_bounce=False)
                 else:
                     self.random_walk = True
-                    self.rw_vx = 2     # 오른쪽으로 다시 걷기
+                    self.rw_vx = 2
                     self.set_action("walk_right", force=True, suppress_bounce=False)
             else:
-                # 랜덤이동 아니면 idle로
                 self.set_action("idle", force=True, suppress_bounce=False)
 
         QtCore.QTimer.singleShot(int(total_sec * 1000), _end_fall)
